@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# dev-external: Fail-closed external SSD TMPDIR guard for macOS AI dev machines.
+# Verifies VolumeUUID before running build/render/test commands and routes TMPDIR
+# to the external SSD so high-volume AI/video/build temp files never fill OS disk.
+#
+# Setup once:
+#   dev-external --init /Volumes/YourExternalSSD
+# Usage:
+#   dev-external --status
+#   dev-external <command> [args...]
+# ==============================================================================
+
+CFG_FILE="${DEV_EXTERNAL_CFG:-$HOME/.config/dev-external/config.env}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dev-external --init <mount_path>   Inspect VolumeUUID via diskutil and save config
+  dev-external --status              Verify configured mount + VolumeUUID + writable TMPDIR
+  dev-external <command> [args...]   Verify SSD UUID, set TMPDIR, and exec command
+
+Environment overrides (optional, override config file):
+  DEV_EXTERNAL_MOUNT   Mount path (e.g. /Volumes/Dev)
+  DEV_EXTERNAL_UUID    Expected APFS/HFS VolumeUUID
+  DEV_EXTERNAL_TMPDIR  Optional custom temp directory inside the volume
+EOF
+}
+
+get_volume_uuid() {
+  local mount_path="$1"
+  /usr/sbin/diskutil info -plist "$mount_path" 2>/dev/null \
+    | /usr/bin/plutil -extract VolumeUUID raw -o - - 2>/dev/null || return 1
+}
+
+if [ "$#" -eq 0 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+if [ "$1" = "--init" ]; then
+  MOUNT_ARG="${2:?Missing mount path, e.g. dev-external --init /Volumes/Dev}"
+  if [ ! -d "$MOUNT_ARG" ]; then
+    echo "❌ Mount path does not exist: $MOUNT_ARG" >&2
+    exit 1
+  fi
+  UUID="$(get_volume_uuid "$MOUNT_ARG" || true)"
+  if [ -z "$UUID" ]; then
+    echo "❌ Could not read VolumeUUID for: $MOUNT_ARG" >&2
+    exit 1
+  fi
+  TMP_DIR="$MOUNT_ARG/tmp/development/"
+  mkdir -p "$TMP_DIR"
+  test -w "$TMP_DIR" || { echo "❌ Not writable: $TMP_DIR" >&2; exit 1; }
+  mkdir -p "$(dirname "$CFG_FILE")"
+  cat > "$CFG_FILE" <<EOF
+DEV_EXTERNAL_MOUNT="$MOUNT_ARG"
+DEV_EXTERNAL_UUID="$UUID"
+DEV_EXTERNAL_TMPDIR="$TMP_DIR"
+EOF
+  chmod 600 "$CFG_FILE"
+  echo "✅ Configured dev-external:"
+  echo "   mount : $MOUNT_ARG"
+  echo "   uuid  : $UUID"
+  echo "   tmpdir: $TMP_DIR"
+  echo "   config: $CFG_FILE"
+  exit 0
+fi
+
+if [ -f "$CFG_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$CFG_FILE"
+fi
+
+MOUNT_PATH="${DEV_EXTERNAL_MOUNT:-}"
+EXPECTED_UUID="${DEV_EXTERNAL_UUID:-}"
+TARGET_TMP="${DEV_EXTERNAL_TMPDIR:-${MOUNT_PATH:+$MOUNT_PATH/tmp/development/}}"
+
+if [ -z "$MOUNT_PATH" ] || [ -z "$EXPECTED_UUID" ]; then
+  echo "❌ dev-external is not configured. Run: dev-external --init /Volumes/YourSSD" >&2
+  exit 1
+fi
+
+ACTUAL_UUID="$(get_volume_uuid "$MOUNT_PATH" || true)"
+if [ -z "$ACTUAL_UUID" ]; then
+  echo "❌ External volume is not mounted: $MOUNT_PATH (refusing to fall back to /tmp)" >&2
+  exit 1
+fi
+
+if [ "$ACTUAL_UUID" != "$EXPECTED_UUID" ]; then
+  echo "❌ VolumeUUID mismatch at $MOUNT_PATH: expected $EXPECTED_UUID, got $ACTUAL_UUID" >&2
+  exit 1
+fi
+
+mkdir -p "$TARGET_TMP"
+if [ ! -w "$TARGET_TMP" ]; then
+  echo "❌ External temporary directory is not writable: $TARGET_TMP" >&2
+  exit 1
+fi
+
+if [ "$1" = "--status" ]; then
+  echo "✅ External volume verified"
+  echo "   mount : $MOUNT_PATH"
+  echo "   uuid  : $ACTUAL_UUID"
+  echo "   tmpdir: $TARGET_TMP"
+  exit 0
+fi
+
+export TMPDIR="$TARGET_TMP"
+exec "$@"

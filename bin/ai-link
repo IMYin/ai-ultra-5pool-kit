@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# ai-link: Bridge local Git repos & Agent Skills with a cloud-synced hub
+# (e.g. Google Drive for Desktop -> AI-Projects/) for cross-device AI workflows.
+#
+# Usage:
+#   ai-link --init-hub        Initialize _REGISTRY.md, _GLOBAL_INBOX.md, _skills/
+#   ai-link --list            Print _REGISTRY.md
+#   ai-link --sync-skills     Bidirectionally sync plain-text skills & _INDEX.md
+#   ai-link --list-skills     Print _skills/_INDEX.md
+#   ai-link [project-name]    Link ./.ai -> <AI_HUB>/<project-name> & update git exclude
+#
+# Optional env vars:
+#   AI_HUB_DIR           Explicit hub directory (overrides Google Drive auto-detect)
+#   GDRIVE_ROOT          Google Drive root directory ("My Drive" / "我的云端硬盘")
+#   AI_LINK_SKILLS_CFG   Optional JSON manifest (default: ~/.config/ai-link/skills.json)
+#   AI_LINK_SKILL_DIRS   Colon-separated local skill dirs to auto-discover
+# ==============================================================================
+
+detect_gdrive_root() {
+  if [ -n "${GDRIVE_ROOT:-}" ] && [ -d "$GDRIVE_ROOT" ]; then
+    echo "$GDRIVE_ROOT"
+    return 0
+  fi
+  for d in "$HOME"/Library/CloudStorage/GoogleDrive-*/"My Drive" \
+           "$HOME"/Library/CloudStorage/GoogleDrive-*/"我的云端硬盘"; do
+    if [ -d "$d" ]; then
+      echo "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_ai_hub() {
+  if [ -n "${AI_HUB_DIR:-}" ]; then
+    mkdir -p "$AI_HUB_DIR"
+    echo "$AI_HUB_DIR"
+    return 0
+  fi
+  local gdrive_base
+  gdrive_base="$(detect_gdrive_root || true)"
+  if [ -z "$gdrive_base" ]; then
+    echo "❌ Cloud Drive mount not found." >&2
+    echo "Sign in to Google Drive for Desktop (Stream/Mirror), or set AI_HUB_DIR=/path/to/AI-Projects" >&2
+    exit 1
+  fi
+  echo "$gdrive_base/AI-Projects"
+}
+
+AI_HUB="$(resolve_ai_hub)"
+REGISTRY_FILE="$AI_HUB/_REGISTRY.md"
+GLOBAL_INBOX="$AI_HUB/_GLOBAL_INBOX.md"
+TODAY="$(date +%Y-%m-%d)"
+
+ensure_hub_files() {
+  mkdir -p "$AI_HUB/_shared" "$AI_HUB/_skills"
+
+  if [ ! -f "$REGISTRY_FILE" ]; then
+    cat <<'EOF' > "$REGISTRY_FILE"
+# AI Projects Registry
+
+> Cross-device project directory shared between cloud AI web UIs and local coding agents.
+
+| Project | Local Path | Cloud Hub Path | Status Summary | Last Updated |
+| :--- | :--- | :--- | :--- | :--- |
+EOF
+    echo "✅ Initialized registry: $REGISTRY_FILE"
+  fi
+
+  if [ ! -f "$GLOBAL_INBOX" ]; then
+    cat <<'EOF' > "$GLOBAL_INBOX"
+# Global Cross-Project Ideas & Specs (_GLOBAL_INBOX)
+
+> Store cross-project notes, mobile brainstorms, or pre-repo specifications here or in `_shared/`.
+> Keep all files in plain-text Markdown (`.md`) or `.json` so both web UIs and local CLIs can read/write directly.
+EOF
+    echo "✅ Initialized global inbox: $GLOBAL_INBOX"
+  fi
+}
+
+sync_skills() {
+  ensure_hub_files
+  python3 - "$AI_HUB" <<'PYEOF'
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime
+
+ai_hub = sys.argv[1]
+skills_hub = os.path.join(ai_hub, "_skills")
+os.makedirs(skills_hub, exist_ok=True)
+home = os.path.expanduser("~")
+
+SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", ".trash", "test", "tests", "out"}
+SKIP_EXTS = {
+    ".pyc", ".pyo", ".mp4", ".mov", ".webm", ".png", ".jpg", ".jpeg",
+    ".webp", ".gif", ".zip", ".tar", ".gz", ".woff", ".woff2", ".ttf",
+    ".otf", ".pdf", ".mp3", ".wav", ".ds_store",
+}
+BUILTIN_IGNORE = {
+    "autopilot", "agent-sdk-create-agent", "canvas", "create-hook",
+    "create-rule", "create-skill", "create-subagent", "goal", "loop",
+    "migrate-to-skills", "new-repo", "origin", "rename-chat", "review",
+    "review-bugbot", "review-security", "sdk", "share", "shell",
+    "split-to-prs", "statusline", "synced", "update-cli-config",
+    "update-cursor-settings", "cloud-skills",
+}
+
+specs = []
+seen_names = set()
+
+# 1) Optional user config: ~/.config/ai-link/skills.json
+# Format: [{"name": "...", "category": "...", "path": "...", "mode": "...", "skip_dirs": []}]
+cfg_path = os.path.expanduser(os.environ.get("AI_LINK_SKILLS_CFG", "~/.config/ai-link/skills.json"))
+if os.path.isfile(cfg_path):
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        user_specs = json.load(f)
+    for item in user_specs:
+        name = item["name"]
+        specs.append((
+            name,
+            item.get("category", "Configured Skills"),
+            os.path.expanduser(item["path"]),
+            item.get("mode", "Cloud + Local Sync"),
+            set(item.get("skip_dirs", [])),
+            [],
+        ))
+        seen_names.add(name)
+
+# 2) Auto-discover standard agent skill roots
+env_dirs = os.environ.get("AI_LINK_SKILL_DIRS", "").strip()
+if env_dirs:
+    scan_roots = [os.path.expanduser(p) for p in env_dirs.split(":") if p.strip()]
+else:
+    scan_roots = [
+        os.path.join(home, ".agents/skills"),
+        os.path.join(home, ".claude/skills"),
+        os.path.join(home, ".cursor/skills"),
+        os.path.join(home, ".codex/skills"),
+        os.path.join(home, ".gemini/config/skills"),
+    ]
+
+for scan_root in scan_roots:
+    if not os.path.isdir(scan_root):
+        continue
+    for entry in sorted(os.listdir(scan_root)):
+        if entry.startswith(".") or entry in BUILTIN_IGNORE or entry in seen_names:
+            continue
+        p = os.path.join(scan_root, entry)
+        if os.path.isdir(p) and os.path.isfile(os.path.join(p, "SKILL.md")):
+            seen_names.add(entry)
+            specs.append((entry, "Local Discovered Skills", p, "Auto-Discovered Sync", set(), []))
+
+def should_skip_file(filename, full_path):
+    if filename.startswith("."):
+        return True
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in SKIP_EXTS:
+        return True
+    if os.path.islink(full_path):
+        return True
+    if ext != ".md" and os.path.getsize(full_path) > 256 * 1024:
+        return True
+    return False
+
+def sync_pair(src_file, dst_file, stats):
+    os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+    if not os.path.exists(dst_file):
+        shutil.copy2(src_file, dst_file)
+        stats["pushed"] += 1
+        return
+    src_m = os.path.getmtime(src_file)
+    dst_m = os.path.getmtime(dst_file)
+    if src_m > dst_m + 2.0:
+        shutil.copy2(src_file, dst_file)
+        stats["pushed"] += 1
+    elif dst_m > src_m + 2.0:
+        shutil.copy2(dst_file, src_file)
+        stats["pulled"] += 1
+    else:
+        stats["unchanged"] += 1
+
+def sync_bundle(local_dir, cloud_dir, extra_skip_dirs, extra_files, stats):
+    os.makedirs(cloud_dir, exist_ok=True)
+    skip_all = SKIP_DIRS | set(extra_skip_dirs)
+
+    if os.path.isdir(local_dir):
+        for dp, dns, fns in os.walk(local_dir):
+            dns[:] = [d for d in dns if d not in skip_all and not d.startswith(".")]
+            rel_dir = os.path.relpath(dp, local_dir)
+            for fn in fns:
+                src_fp = os.path.join(dp, fn)
+                if should_skip_file(fn, src_fp):
+                    continue
+                rel_fp = fn if rel_dir == "." else os.path.join(rel_dir, fn)
+                dst_fp = os.path.join(cloud_dir, rel_fp)
+                sync_pair(src_fp, dst_fp, stats)
+
+    extra_rels = set()
+    for src_fp, rel_fp in extra_files:
+        if os.path.isfile(src_fp):
+            extra_rels.add(rel_fp)
+            dst_fp = os.path.join(cloud_dir, rel_fp)
+            sync_pair(src_fp, dst_fp, stats)
+
+    if os.path.isdir(local_dir):
+        for dp, dns, fns in os.walk(cloud_dir):
+            dns[:] = [d for d in dns if d not in skip_all and not d.startswith(".")]
+            rel_dir = os.path.relpath(dp, cloud_dir)
+            for fn in fns:
+                dst_fp = os.path.join(dp, fn)
+                if should_skip_file(fn, dst_fp):
+                    continue
+                rel_fp = fn if rel_dir == "." else os.path.join(rel_dir, fn)
+                if rel_fp in extra_rels:
+                    continue
+                src_fp = os.path.join(local_dir, rel_fp)
+                if not os.path.exists(src_fp):
+                    os.makedirs(os.path.dirname(src_fp), exist_ok=True)
+                    shutil.copy2(dst_fp, src_fp)
+                    stats["pulled"] += 1
+
+def extract_description(skill_dir):
+    skill_md = os.path.join(skill_dir, "SKILL.md")
+    if os.path.isfile(skill_md):
+        with open(skill_md, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read(8192)
+        m = re.match(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", text, re.DOTALL)
+        if m:
+            lines = m.group(1).splitlines()
+            for i, line in enumerate(lines):
+                dm = re.match(r"^description:\s*(.*)$", line)
+                if not dm:
+                    continue
+                val = dm.group(1).strip()
+                if val in (">-", ">", "|-", "|"):
+                    buf = []
+                    for nxt in lines[i + 1:]:
+                        if re.match(r"^[A-Za-z0-9_-]+:\s*", nxt):
+                            break
+                        stripped = nxt.strip()
+                        if stripped:
+                            buf.append(stripped)
+                    desc = " ".join(buf)
+                else:
+                    desc = val.strip().strip('"').strip("'")
+                desc = re.sub(r"\s+", " ", desc).strip()
+                if desc:
+                    return desc[:140] + ("…" if len(desc) > 140 else "")
+    readme = os.path.join(skill_dir, "README.md")
+    if os.path.isfile(readme):
+        with open(readme, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    s = re.sub(r"\s+", " ", s)
+                    return s[:140] + ("…" if len(s) > 140 else "")
+    return "Shared skill directory"
+
+stats = {"pushed": 0, "pulled": 0, "unchanged": 0, "new_from_cloud": 0}
+entries_by_cat = {}
+
+for name, cat, local_dir, mode, extra_skip, extra_files in specs:
+    if not os.path.isdir(local_dir):
+        continue
+    cloud_dir = os.path.join(skills_hub, name)
+    sync_bundle(local_dir, cloud_dir, extra_skip, extra_files, stats)
+    entry_file = "SKILL.md" if os.path.isfile(os.path.join(cloud_dir, "SKILL.md")) else "README.md"
+    desc = extract_description(cloud_dir).replace("|", "\\|")
+    entries_by_cat.setdefault(cat, []).append((name, f"_skills/{name}/{entry_file}", mode, desc))
+
+# Pull any brand-new cloud-created skills back to local target dir
+default_local_root = os.path.expanduser(os.environ.get("AI_LINK_PULL_DIR", "~/.agents/skills"))
+if not env_dirs:
+    os.makedirs(default_local_root, exist_ok=True)
+else:
+    default_local_root = scan_roots[0]
+    os.makedirs(default_local_root, exist_ok=True)
+
+for item in sorted(os.listdir(skills_hub)):
+    if item.startswith(".") or item.startswith("_") or item in seen_names:
+        continue
+    cloud_dir = os.path.join(skills_hub, item)
+    if os.path.isdir(cloud_dir) and os.path.isfile(os.path.join(cloud_dir, "SKILL.md")):
+        target_local = os.path.join(default_local_root, item)
+        if not os.path.exists(target_local):
+            shutil.copytree(cloud_dir, target_local)
+            stats["new_from_cloud"] += 1
+        desc = extract_description(cloud_dir).replace("|", "\\|")
+        entries_by_cat.setdefault("Cloud Created Skills", []).append((item, f"_skills/{item}/SKILL.md", "Pulled from Cloud", desc))
+
+total_files, total_bytes = 0, 0
+for dp, dns, fns in os.walk(skills_hub):
+    dns[:] = [d for d in dns if not d.startswith(".")]
+    for fn in fns:
+        if fn.startswith("."):
+            continue
+        total_files += 1
+        total_bytes += os.path.getsize(os.path.join(dp, fn))
+
+now_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %z")
+lines = [
+    "# Shared Skill Library Index (`_skills/_INDEX.md`)",
+    "",
+    f"> **Last Sync**: {now_str} | **Skills**: {sum(len(v) for v in entries_by_cat.values())} | **Size**: {total_files} text files ({total_bytes / 1024:.1f} KB)",
+    "",
+]
+
+for cat, rows in entries_by_cat.items():
+    lines.append(f"## {cat}")
+    lines.append("")
+    lines.append("| Skill | Cloud Path | Mode | Description |")
+    lines.append("| :--- | :--- | :--- | :--- |")
+    for name, rel_path, mode, desc in rows:
+        link_target = rel_path.replace("_skills/", "./", 1)
+        lines.append(f"| `{name}` | [`{rel_path}`]({link_target}) | {mode} | {desc} |")
+    lines.append("")
+
+index_path = os.path.join(skills_hub, "_INDEX.md")
+with open(index_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines))
+
+print(
+    f"✅ Skills synced to {skills_hub}\n"
+    f"   - pushed(local->cloud): {stats['pushed']}\n"
+    f"   - pulled(cloud->local): {stats['pulled']}\n"
+    f"   - new_from_cloud: {stats['new_from_cloud']}\n"
+    f"   - unchanged: {stats['unchanged']}\n"
+    f"   - index: {index_path} ({total_files} files, {total_bytes/1024:.1f} KB)"
+)
+PYEOF
+}
+
+case "${1:-}" in
+  --init-hub)
+    ensure_hub_files
+    echo "🎉 AI hub initialized: $AI_HUB"
+    exit 0
+    ;;
+  --list)
+    ensure_hub_files
+    cat "$REGISTRY_FILE"
+    exit 0
+    ;;
+  --sync-skills)
+    sync_skills
+    exit 0
+    ;;
+  --list-skills)
+    if [ ! -f "$AI_HUB/_skills/_INDEX.md" ]; then
+      sync_skills
+    fi
+    cat "$AI_HUB/_skills/_INDEX.md"
+    exit 0
+    ;;
+  -h|--help)
+    echo "Usage:"
+    echo "  ai-link --init-hub        Initialize AI hub (_REGISTRY.md, _GLOBAL_INBOX.md)"
+    echo "  ai-link --list            Show registered projects"
+    echo "  ai-link --sync-skills     Bidirectionally sync skills and build _skills/_INDEX.md"
+    echo "  ai-link --list-skills     Print _skills/_INDEX.md"
+    echo "  ai-link [project-name]    Symlink ./.ai -> <AI_HUB>/<project> & inject AGENTS.md rules"
+    exit 0
+    ;;
+esac
+
+ensure_hub_files
+
+REPO_DIR="$(pwd)"
+PROJECT_NAME="${1:-$(basename "$REPO_DIR")}"
+CLOUD_PROJ_DIR="$AI_HUB/$PROJECT_NAME"
+
+mkdir -p "$CLOUD_PROJ_DIR/specs"
+
+if ! grep -Fq "| $PROJECT_NAME |" "$REGISTRY_FILE"; then
+  echo "| $PROJECT_NAME | \`$REPO_DIR\` | \`AI-Projects/$PROJECT_NAME\` | Linked, pending initial scan | $TODAY |" >> "$REGISTRY_FILE"
+  echo "✅ Registered project: $REGISTRY_FILE"
+fi
+
+if [ ! -f "$CLOUD_PROJ_DIR/CONTEXT.md" ]; then
+  cat <<EOF > "$CLOUD_PROJ_DIR/CONTEXT.md"
+# $PROJECT_NAME - Project Context (CONTEXT)
+
+## 1. Core Goal & Scope
+- (To be populated by local coding agent on first scan)
+
+## 2. Tech Stack & Layout
+- Languages / Frameworks:
+- Entry points & modules:
+- Build / Test commands:
+
+## 3. Architecture Constraints & Compliance
+- 
+EOF
+fi
+
+if [ ! -f "$CLOUD_PROJ_DIR/STATUS.md" ]; then
+  cat <<EOF > "$CLOUD_PROJ_DIR/STATUS.md"
+# $PROJECT_NAME - Status Tracker (STATUS)
+
+- **Last Updated**: $TODAY
+- **Phase**: Cross-device \`.ai/\` symlink initialized
+
+## Recently Completed
+- [x] Linked local repo \`.ai/\` <-> cloud hub \`AI-Projects/$PROJECT_NAME\`
+
+## Blockers / Notes
+- None
+
+## Next TODO
+- [ ] Scan codebase and populate \`CONTEXT.md\` & \`STATUS.md\`
+EOF
+fi
+
+if [ ! -f "$CLOUD_PROJ_DIR/INBOX.md" ]; then
+  cat <<EOF > "$CLOUD_PROJ_DIR/INBOX.md"
+# $PROJECT_NAME - Cloud-to-Local Handoff Inbox (INBOX)
+
+<!-- Append tasks, specs, or mobile prompts here in plain Markdown; local agent consumes on startup. -->
+EOF
+fi
+
+if [ -L "$REPO_DIR/.ai" ] || [ -e "$REPO_DIR/.ai" ]; then
+  echo "ℹ️  Keeping existing .ai path: $REPO_DIR/.ai"
+else
+  ln -s "$CLOUD_PROJ_DIR" "$REPO_DIR/.ai"
+  echo "✅ Created symlink: .ai -> $CLOUD_PROJ_DIR"
+fi
+
+if git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  EXCLUDE_FILE="$(git -C "$REPO_DIR" rev-parse --git-path info/exclude)"
+  mkdir -p "$(dirname "$EXCLUDE_FILE")"
+  touch "$EXCLUDE_FILE"
+  if ! grep -qxF ".ai" "$EXCLUDE_FILE"; then
+    echo ".ai" >> "$EXCLUDE_FILE"
+    echo "✅ Added .ai to local git exclude ($EXCLUDE_FILE)"
+  fi
+fi
+
+AGENTS_FILE="$REPO_DIR/AGENTS.md"
+SYNC_MARKER="## Cloud Context Sync (.ai/)"
+
+SYNC_BLOCK='## Cloud Context Sync (.ai/)
+This repository syncs shared context with a cloud AI workspace through `.ai/`:
+1. **Read on start**: Read `.ai/CONTEXT.md`, `.ai/STATUS.md`, and `.ai/INBOX.md` before planning or coding.
+2. **Consume inbox**: Pick up pending tasks/specs in `.ai/INBOX.md` and `.ai/specs/`, then clear or archive completed items into `.ai/STATUS.md`.
+3. **Write back on finish**: Update `.ai/STATUS.md` (summary, blockers, next TODO) before ending the session, and update `.ai/CONTEXT.md` on architectural changes.
+4. **Plain text only**: Keep all `.ai/` files in plain Markdown/JSON (no proprietary online docs) so both web UIs and local CLIs can access them directly.'
+
+if [ ! -f "$AGENTS_FILE" ]; then
+  printf "# Agent Instructions\n\n%s\n" "$SYNC_BLOCK" > "$AGENTS_FILE"
+  echo "✅ Created AGENTS.md with Cloud Context Sync rules"
+elif ! grep -Fq "$SYNC_MARKER" "$AGENTS_FILE"; then
+  printf "\n%s\n" "$SYNC_BLOCK" >> "$AGENTS_FILE"
+  echo "✅ Appended Cloud Context Sync rules to AGENTS.md"
+else
+  echo "ℹ️  AGENTS.md already contains Cloud Context Sync rules"
+fi
+
+echo "🎉 [$PROJECT_NAME] .ai/ bridge ready!"
