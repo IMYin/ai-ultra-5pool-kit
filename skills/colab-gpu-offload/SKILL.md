@@ -1,17 +1,17 @@
 ---
 name: colab-gpu-offload
-description: Offload GPU-heavy AI inference, batch frame rendering, TTS voice cloning, and high-bandwidth dataset tasks to Google Colab L4 GPUs via google-colab-cli with strict zero-leak VM termination and stdout limits.
+description: Offload GPU-heavy AI inference, batch frame rendering, TTS/Whisper pipelines, and high-bandwidth dataset tasks to Google Colab L4 GPUs via google-colab-cli with strict zero-leak VM termination and stdout limits.
 ---
 
 # Colab GPU Offload (`google-colab-cli`)
 
-Use `google-colab-cli` (`colab`) to offload heavy GPU / CPU / high-bandwidth jobs from a local workstation to remote **NVIDIA L4 (24GB VRAM)** instances without spinning up local fans or wasting subscription compute units.
+Use `google-colab-cli` (`colab`) to offload heavy GPU / CPU / high-bandwidth jobs from a local workstation to remote **NVIDIA L4 (24GB VRAM)** instances without spinning up local fans or wasting compute units.
 
 ## 1. Ideal Tasks for Offloading
 
-1. **Audio & Voice Pipelines**: Batch TTS inference (`F5-TTS`, etc.), Whisper alignment verification, stem separation.
-2. **Headless Video & Frame Rendering**: Parallel headless Chrome rendering (`Remotion`, `Puppeteer`), batch supersampled GIF encoding.
-3. **Batch Dataset & High-Bandwidth Jobs**: Pulling remote archives, building large Parquet grids, ML fine-tuning/evaluation.
+1. **Audio & Voice Pipelines**: Batch TTS inference, Whisper alignment verification, stem separation.
+2. **Headless Video & Frame Rendering**: Parallel headless browser rendering, batch GIF/video encoding.
+3. **Batch Dataset & High-Bandwidth Jobs**: Pulling large remote archives, ML fine-tuning/evaluation, Parquet crunching.
 
 ## 2. Five Anti-Waste & Zero-Leak Iron Laws
 
@@ -27,7 +27,7 @@ Use `google-colab-cli` (`colab`) to offload heavy GPU / CPU / high-bandwidth job
      colab new -s worker --gpu L4
      colab drivemount -s worker
      ```
-   - Never run thousands of small frame/chunk writes directly on `/content/drive`. Compute everything on `/content/scratch/` local NVMe SSD first, package final artifacts (`.mp4` / `.tar.gz` / `.wav`), then copy back with `colab download` or `rsync`.
+   - Never run thousands of small frame/chunk writes directly on `/content/drive`. Compute everything on `/content/scratch/` first, package final artifacts (`.mp4` / `.tar.gz` / `.json`), then download via `colab download` or copy to Drive with `rsync`.
 4. **Enforce Zero-Leak Termination (`trap cleanup EXIT`)**:
    - Every `colab new` workflow must wrap cleanup in `trap`:
      ```bash
@@ -37,9 +37,9 @@ Use `google-colab-cli` (`colab`) to offload heavy GPU / CPU / high-bandwidth job
      }
      trap cleanup EXIT
      ```
-   - Always confirm `colab sessions` prints **zero active instances** when done.
+   - Always confirm `colab sessions` prints **zero active instances** when finished.
 5. **Prevent Local Context Window Explosion**:
-   - Remote scripts must never print >50 lines of tables, raw logs, or Base64 strings to stdout. Write detailed reports to files in `/content/scratch/`, print only concise metrics (paths, durations, pass/fail), and download files locally if inspection is needed.
+   - Remote scripts must never print >50 lines of tables, raw logs, or Base64 strings to stdout. Write detailed outputs to `/content/scratch/`, print only concise metrics, and inspect files after download.
 
 ## 3. Quick Reference
 
@@ -51,5 +51,5 @@ colab run --gpu L4 --timeout 0 path/to/job.py
 
 Or use the bundled Zero-Leak runner:
 ```bash
-./scripts/colab_zero_leak.sh my-job /path/to/remote_job.py /content/scratch/out.mp4 ./out.mp4
+./scripts/colab_zero_leak.sh --drive my-job /path/to/remote_job.py /content/scratch/out.bin ./out.bin
 ```

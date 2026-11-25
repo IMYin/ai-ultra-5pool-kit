@@ -1,16 +1,21 @@
-[
-  {
-    "name": "colab-gpu-offload",
-    "category": "Compute Offload",
-    "path": "~/.agents/skills/colab-gpu-offload",
-    "mode": "Local Execution",
-    "skip_dirs": []
-  },
-  {
-    "name": "ai-cloud-sync",
-    "category": "Workspace Sync",
-    "path": "~/.agents/skills/ai-cloud-sync",
-    "mode": "Cloud + Local Sync",
-    "skip_dirs": []
-  }
-]
+{
+  "ignore": [
+    "some-internal-skill-to-skip"
+  ],
+  "skills": [
+    {
+      "name": "colab-gpu-offload",
+      "category": "Compute Offload",
+      "path": "~/.agents/skills/colab-gpu-offload",
+      "mode": "Local Execution",
+      "skip_dirs": []
+    },
+    {
+      "name": "ai-cloud-sync",
+      "category": "Workspace Sync",
+      "path": "~/.agents/skills/ai-cloud-sync",
+      "mode": "Cloud + Local Sync",
+      "skip_dirs": []
+    }
+  ]
+}

@@ -7,28 +7,43 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  colab_zero_leak.sh <session-name> <local-script.py> [remote-artifact-path] [local-dest-path] [--drive]
+  colab_zero_leak.sh [--drive] <session-name> <local-script.py> [remote-artifact-path] [local-dest-path]
+
+Options:
+  --drive      Mount Google Drive inside the Colab VM before running the script
 
 Environment overrides:
   COLAB_BIN    Path to colab CLI (default: colab)
   COLAB_GPU    GPU type passed to `colab new` (default: L4)
-  EXEC_PREFIX  Optional wrapper prefix (e.g. dev-external)
 EOF
 }
 
-if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "$#" -lt 2 ]; then
+MOUNT_DRIVE=0
+POS_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --drive)
+      MOUNT_DRIVE=1
+      ;;
+    *)
+      POS_ARGS+=("$arg")
+      ;;
+  esac
+done
+
+if [ "${#POS_ARGS[@]}" -lt 2 ]; then
   usage
-  [ "$#" -lt 2 ] && [ "${1:-}" != "-h" ] && [ "${1:-}" != "--help" ] && exit 2 || exit 0
+  exit 2
 fi
 
-SESSION="$1"
-SCRIPT_PATH="$2"
-REMOTE_OUT="${3:-}"
-LOCAL_OUT="${4:-}"
-MOUNT_DRIVE=0
-for arg in "$@"; do
-  [ "$arg" = "--drive" ] && MOUNT_DRIVE=1
-done
+SESSION="${POS_ARGS[0]}"
+SCRIPT_PATH="${POS_ARGS[1]}"
+REMOTE_OUT="${POS_ARGS[2]:-}"
+LOCAL_OUT="${POS_ARGS[3]:-}"
 
 if [ ! -f "$SCRIPT_PATH" ]; then
   echo "❌ Script not found: $SCRIPT_PATH" >&2
@@ -37,29 +52,22 @@ fi
 
 COLAB="${COLAB_BIN:-colab}"
 GPU="${COLAB_GPU:-L4}"
-run_colab() {
-  if [ -n "${EXEC_PREFIX:-}" ]; then
-    "$EXEC_PREFIX" "$COLAB" "$@"
-  else
-    "$COLAB" "$@"
-  fi
-}
 
 cleanup() {
   echo "=== [Zero-Leak] Stopping Colab session: $SESSION ==="
-  run_colab stop -s "$SESSION" || true
-  run_colab sessions || true
+  "$COLAB" stop -s "$SESSION" || true
+  "$COLAB" sessions || true
 }
 trap cleanup EXIT
 
-run_colab new -s "$SESSION" --gpu "$GPU"
+"$COLAB" new -s "$SESSION" --gpu "$GPU"
 if [ "$MOUNT_DRIVE" -eq 1 ]; then
-  run_colab drivemount -s "$SESSION"
+  "$COLAB" drivemount -s "$SESSION"
 fi
-run_colab exec -s "$SESSION" --timeout 0 -f "$SCRIPT_PATH"
+"$COLAB" exec -s "$SESSION" --timeout 0 -f "$SCRIPT_PATH"
 
 if [ -n "$REMOTE_OUT" ] && [ -n "$LOCAL_OUT" ]; then
   mkdir -p "$(dirname "$LOCAL_OUT")"
-  run_colab download -s "$SESSION" "$REMOTE_OUT" "$LOCAL_OUT"
+  "$COLAB" download -s "$SESSION" "$REMOTE_OUT" "$LOCAL_OUT"
   echo "✅ Downloaded $REMOTE_OUT -> $LOCAL_OUT"
 fi

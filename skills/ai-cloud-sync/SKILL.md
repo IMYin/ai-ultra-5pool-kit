@@ -1,6 +1,6 @@
 ---
 name: ai-cloud-sync
-description: Cross-device .ai/ shared-memory workflow connecting local coding agents (Claude Code, Cursor, Codex, Antigravity) with browser/mobile cloud AI workspaces via plain-text CONTEXT.md, STATUS.md, INBOX.md, and specs/.
+description: Cross-device .ai/ shared-memory workflow connecting local coding agents (Claude Code, Cursor, Codex, Antigravity, Windsurf) with browser/mobile cloud AI workspaces via plain-text CONTEXT.md, STATUS.md, INBOX.md, and specs/.
 ---
 
 # Cloud Context Sync (`.ai/` Protocol)

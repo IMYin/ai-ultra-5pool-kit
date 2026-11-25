@@ -3,31 +3,63 @@ set -euo pipefail
 
 # ==============================================================================
 # ai-link: Bridge local Git repos & Agent Skills with a cloud-synced hub
-# (e.g. Google Drive for Desktop -> AI-Projects/) for cross-device AI workflows.
+# (Google Drive, iCloud, Dropbox, OneDrive, Syncthing, etc.) via `.ai/`.
 #
 # Usage:
+#   ai-link --set-hub <dir>   Persist a custom cloud hub directory (~/.config/ai-link/config.env)
 #   ai-link --init-hub        Initialize _REGISTRY.md, _GLOBAL_INBOX.md, _skills/
 #   ai-link --list            Print _REGISTRY.md
 #   ai-link --sync-skills     Bidirectionally sync plain-text skills & _INDEX.md
 #   ai-link --list-skills     Print _skills/_INDEX.md
-#   ai-link [project-name]    Link ./.ai -> <AI_HUB>/<project-name> & update git exclude
+#   ai-link [project-name]    Symlink ./.ai -> <AI_HUB>/<project-name> & update git exclude
+#   ai-link --unlink          Remove ./.ai symlink and local .git/info/exclude entry
 #
 # Optional env vars:
-#   AI_HUB_DIR           Explicit hub directory (overrides Google Drive auto-detect)
-#   GDRIVE_ROOT          Google Drive root directory ("My Drive" / "我的云端硬盘")
+#   AI_HUB_DIR           Explicit hub directory (overrides config & auto-detect)
+#   GDRIVE_ROOT          Google Drive root directory ("My Drive" / etc.)
+#   AI_LINK_CFG          Config file path (default: ~/.config/ai-link/config.env)
 #   AI_LINK_SKILLS_CFG   Optional JSON manifest (default: ~/.config/ai-link/skills.json)
 #   AI_LINK_SKILL_DIRS   Colon-separated local skill dirs to auto-discover
 # ==============================================================================
+
+AI_LINK_CFG="${AI_LINK_CFG:-$HOME/.config/ai-link/config.env}"
+if [ -f "$AI_LINK_CFG" ]; then
+  # shellcheck disable=SC1090
+  source "$AI_LINK_CFG"
+fi
 
 detect_gdrive_root() {
   if [ -n "${GDRIVE_ROOT:-}" ] && [ -d "$GDRIVE_ROOT" ]; then
     echo "$GDRIVE_ROOT"
     return 0
   fi
-  for d in "$HOME"/Library/CloudStorage/GoogleDrive-*/"My Drive" \
-           "$HOME"/Library/CloudStorage/GoogleDrive-*/"我的云端硬盘"; do
-    if [ -d "$d" ]; then
-      echo "$d"
+
+  local drive_names=("My Drive" "我的云端硬盘" "マイドライブ" "내 드라이브")
+  local candidate
+
+  # macOS Google Drive for Desktop
+  for candidate in "$HOME"/Library/CloudStorage/GoogleDrive-*/*; do
+    if [ -d "$candidate" ]; then
+      for dn in "${drive_names[@]}"; do
+        if [ "$(basename "$candidate")" = "$dn" ]; then
+          echo "$candidate"
+          return 0
+        fi
+      done
+    fi
+  done
+
+  # Linux / Desktop legacy mounts & Windows WSL2 / Git Bash
+  for candidate in \
+    "$HOME/Google Drive/My Drive" \
+    "$HOME/Google Drive" \
+    "$HOME/google-drive" \
+    /mnt/[a-z]/"My Drive" \
+    /mnt/[a-z]/"我的云端硬盘" \
+    /[a-z]/"My Drive" \
+    /[a-z]/"我的云端硬盘"; do
+    if [ -d "$candidate" ]; then
+      echo "$candidate"
       return 0
     fi
   done
@@ -43,12 +75,61 @@ resolve_ai_hub() {
   local gdrive_base
   gdrive_base="$(detect_gdrive_root || true)"
   if [ -z "$gdrive_base" ]; then
-    echo "❌ Cloud Drive mount not found." >&2
-    echo "Sign in to Google Drive for Desktop (Stream/Mirror), or set AI_HUB_DIR=/path/to/AI-Projects" >&2
+    echo "❌ Cloud hub directory not found automatically." >&2
+    echo "Run 'ai-link --set-hub /path/to/your/CloudDrive/AI-Projects' or export AI_HUB_DIR=..." >&2
     exit 1
   fi
   echo "$gdrive_base/AI-Projects"
 }
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  cat <<'EOF'
+Usage:
+  ai-link --set-hub <dir>   Save custom cloud hub path (for iCloud, Dropbox, OneDrive, Linux, WSL2, etc.)
+  ai-link --init-hub        Initialize AI hub (_REGISTRY.md, _GLOBAL_INBOX.md, _skills/)
+  ai-link --list            Show registered projects
+  ai-link --sync-skills     Bidirectionally sync skills and build _skills/_INDEX.md
+  ai-link --list-skills     Print _skills/_INDEX.md
+  ai-link [project-name]    Symlink ./.ai -> <AI_HUB>/<project> & inject AGENTS.md rules
+  ai-link --unlink          Remove ./.ai symlink and local .git/info/exclude rule (keeps cloud data)
+EOF
+  exit 0
+fi
+
+if [ "${1:-}" = "--set-hub" ]; then
+  HUB_ARG="${2:?Missing directory path, e.g. ai-link --set-hub ~/Dropbox/AI-Projects}"
+  mkdir -p "$HUB_ARG" "$(dirname "$AI_LINK_CFG")"
+  ABS_HUB="$(cd "$HUB_ARG" && pwd)"
+  cat > "$AI_LINK_CFG" <<EOF
+AI_HUB_DIR="$ABS_HUB"
+EOF
+  chmod 600 "$AI_LINK_CFG"
+  echo "✅ Saved cloud hub path: $ABS_HUB ($AI_LINK_CFG)"
+  exit 0
+fi
+
+if [ "${1:-}" = "--unlink" ]; then
+  REPO_DIR="$(pwd)"
+  if [ -L "$REPO_DIR/.ai" ]; then
+    rm "$REPO_DIR/.ai"
+    echo "✅ Removed .ai symlink from $REPO_DIR"
+  elif [ -e "$REPO_DIR/.ai" ]; then
+    echo "ℹ️  $REPO_DIR/.ai is not a symlink; leaving it untouched." >&2
+    exit 1
+  else
+    echo "ℹ️  No .ai symlink found in $REPO_DIR"
+  fi
+  if git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    EXCLUDE_FILE="$(git -C "$REPO_DIR" rev-parse --git-path info/exclude)"
+    if [ -f "$EXCLUDE_FILE" ] && grep -qxF ".ai" "$EXCLUDE_FILE"; then
+      TMP_EX="${EXCLUDE_FILE}.tmp.$$"
+      grep -vxF ".ai" "$EXCLUDE_FILE" > "$TMP_EX" || true
+      mv "$TMP_EX" "$EXCLUDE_FILE"
+      echo "✅ Removed .ai from $EXCLUDE_FILE"
+    fi
+  fi
+  exit 0
+fi
 
 AI_HUB="$(resolve_ai_hub)"
 REGISTRY_FILE="$AI_HUB/_REGISTRY.md"
@@ -102,24 +183,24 @@ SKIP_EXTS = {
     ".webp", ".gif", ".zip", ".tar", ".gz", ".woff", ".woff2", ".ttf",
     ".otf", ".pdf", ".mp3", ".wav", ".ds_store",
 }
-BUILTIN_IGNORE = {
-    "autopilot", "agent-sdk-create-agent", "canvas", "create-hook",
-    "create-rule", "create-skill", "create-subagent", "goal", "loop",
-    "migrate-to-skills", "new-repo", "origin", "rename-chat", "review",
-    "review-bugbot", "review-security", "sdk", "share", "shell",
-    "split-to-prs", "statusline", "synced", "update-cli-config",
-    "update-cursor-settings", "cloud-skills",
-}
+BUILTIN_IGNORE = {"cloud-skills"}
 
 specs = []
 seen_names = set()
 
-# 1) Optional user config: ~/.config/ai-link/skills.json
-# Format: [{"name": "...", "category": "...", "path": "...", "mode": "...", "skip_dirs": []}]
+# Optional config: ~/.config/ai-link/skills.json
+# Supports either:
+#   - list of {"name", "category", "path", "mode", "skip_dirs"}
+#   - dict {"ignore": [...], "skills": [...]}
 cfg_path = os.path.expanduser(os.environ.get("AI_LINK_SKILLS_CFG", "~/.config/ai-link/skills.json"))
 if os.path.isfile(cfg_path):
     with open(cfg_path, "r", encoding="utf-8") as f:
-        user_specs = json.load(f)
+        raw_cfg = json.load(f)
+    if isinstance(raw_cfg, dict):
+        BUILTIN_IGNORE.update(raw_cfg.get("ignore", []))
+        user_specs = raw_cfg.get("skills", [])
+    else:
+        user_specs = raw_cfg
     for item in user_specs:
         name = item["name"]
         specs.append((
@@ -132,7 +213,6 @@ if os.path.isfile(cfg_path):
         ))
         seen_names.add(name)
 
-# 2) Auto-discover standard agent skill roots
 env_dirs = os.environ.get("AI_LINK_SKILL_DIRS", "").strip()
 if env_dirs:
     scan_roots = [os.path.expanduser(p) for p in env_dirs.split(":") if p.strip()]
@@ -274,16 +354,13 @@ for name, cat, local_dir, mode, extra_skip, extra_files in specs:
     desc = extract_description(cloud_dir).replace("|", "\\|")
     entries_by_cat.setdefault(cat, []).append((name, f"_skills/{name}/{entry_file}", mode, desc))
 
-# Pull any brand-new cloud-created skills back to local target dir
 default_local_root = os.path.expanduser(os.environ.get("AI_LINK_PULL_DIR", "~/.agents/skills"))
-if not env_dirs:
-    os.makedirs(default_local_root, exist_ok=True)
-else:
+if env_dirs:
     default_local_root = scan_roots[0]
-    os.makedirs(default_local_root, exist_ok=True)
+os.makedirs(default_local_root, exist_ok=True)
 
 for item in sorted(os.listdir(skills_hub)):
-    if item.startswith(".") or item.startswith("_") or item in seen_names:
+    if item.startswith(".") or item.startswith("_") or item in seen_names or item in BUILTIN_IGNORE:
         continue
     cloud_dir = os.path.join(skills_hub, item)
     if os.path.isdir(cloud_dir) and os.path.isfile(os.path.join(cloud_dir, "SKILL.md")):
@@ -356,15 +433,6 @@ case "${1:-}" in
       sync_skills
     fi
     cat "$AI_HUB/_skills/_INDEX.md"
-    exit 0
-    ;;
-  -h|--help)
-    echo "Usage:"
-    echo "  ai-link --init-hub        Initialize AI hub (_REGISTRY.md, _GLOBAL_INBOX.md)"
-    echo "  ai-link --list            Show registered projects"
-    echo "  ai-link --sync-skills     Bidirectionally sync skills and build _skills/_INDEX.md"
-    echo "  ai-link --list-skills     Print _skills/_INDEX.md"
-    echo "  ai-link [project-name]    Symlink ./.ai -> <AI_HUB>/<project> & inject AGENTS.md rules"
     exit 0
     ;;
 esac
